@@ -32,7 +32,7 @@ jobs:
           context: .
           push: true
           tags: |
-            sinzzzz/stremio-ai-search:latest   # ← This is what matters!
+            sinzzzz/stremio-ai-search:latest
       
       # Step 5: Verify
       - name: Verify push
