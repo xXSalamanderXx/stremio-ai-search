@@ -38,6 +38,10 @@
         color: var(--primary-color);
         font-size: 14px;
       }
+      .checkbox-container label {
+        color: var(--primary-color);
+        font-size: 14px;
+      }
       input[type="text"],
       input[type="number"],
       input[type="password"],
@@ -202,6 +206,15 @@
           padding: 12px;
           font-size: 16px;
           height: 48px;
+        }
+        .trakt-button-group {
+          flex-direction: column;
+          gap: 8px;
+        }
+        .trakt-button-group .secondary-button {
+          flex: unset !important;
+          width: 100%;
+          margin-left: 0 !important;
         }
       }
 
@@ -545,6 +558,23 @@
       <form id="configForm">
         <!-- Basic Configuration (Always Visible) -->
         <div class="form-group">
+          <label class="form-label" for="aiProvider"
+            >AI Provider <span class="required">*</span></label
+          >
+          <select id="aiProvider" class="form-select">
+            <option value="gemini" selected>Gemini (Google AI Studio)</option>
+            <option value="openai-compat">
+              OpenAI-compatible (OpenAI / OpenRouter / Z.ai / etc.)
+            </option>
+          </select>
+          <div class="help-text">
+            Choose either a Gemini-compatible model or any OpenAI-compatible
+            endpoint.
+          </div>
+        </div>
+
+        <div id="geminiFields">
+        <div class="form-group">
           <label class="form-label" for="geminiKey"
             >Gemini API Key <span class="required">*</span></label
           >
@@ -558,6 +588,76 @@
             <a href="https://makersuite.google.com/app/apikey" target="_blank"
               >Google AI Studio</a
             >
+          </div>
+        </div>
+        </div>
+
+        <div id="openaiCompatFields" style="display: none;">
+          <div class="form-group">
+            <label class="form-label" for="openaiCompatApiKey"
+              >OpenAI-Compatible API Key <span class="required">*</span></label
+            >
+            <input
+              type="password"
+              id="openaiCompatApiKey"
+              placeholder="Enter your API key (OpenAI/OpenRouter/Z.ai/etc.)"
+            />
+            <div class="help-text">
+              Works with any OpenAI-compatible provider. For OpenRouter, use an
+              API key from
+              <a href="https://openrouter.ai/keys" target="_blank">OpenRouter</a
+              >.
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="openaiCompatModel"
+              >Model <span class="required">*</span></label
+            >
+            <input
+              type="text"
+              id="openaiCompatModel"
+              placeholder="e.g., gpt-4o-mini or openai/gpt-4o-mini"
+              value="gpt-4o-mini"
+            />
+            <div class="help-text">
+              Use a model name supported by your provider (OpenRouter uses names
+              like <code>openai/gpt-4o-mini</code>).
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="openaiCompatBaseUrl"
+              >Base URL (Optional)</label
+            >
+            <input
+              type="text"
+              id="openaiCompatBaseUrl"
+              placeholder="Default: https://api.openai.com"
+            />
+            <div class="help-text">
+              Examples:
+              <code>https://api.openai.com</code>,
+              <code>https://openrouter.ai/api</code>,
+              <code>https://openrouter.ai/api/v1</code>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="openaiCompatExtraHeaders"
+              >Extra Headers (Optional)</label
+            >
+            <textarea
+              id="openaiCompatExtraHeaders"
+              class="form-textarea"
+              placeholder='JSON object, e.g. {"HTTP-Referer":"https://example.com","X-Title":"Stremio AI Search"}'
+              rows="3"
+            ></textarea>
+            <div class="help-text">
+              Optional JSON headers to send with requests (some providers like
+              OpenRouter recommend <code>HTTP-Referer</code> and
+              <code>X-Title</code>). Don’t include <code>Authorization</code>.
+            </div>
           </div>
         </div>
 
@@ -709,14 +809,24 @@
 
           <div class="form-group">
             <label class="form-label">Trakt.tv Integration</label>
-            <button
-              id="traktAuthBtn"
-              class="secondary-button"
-              onclick="authenticateTrakt()"
-              style="margin-bottom: 10px"
-            >
-              Login with Trakt.tv
-            </button>
+            <div class="trakt-button-group" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+              <button
+                id="traktAuthBtn"
+                class="secondary-button"
+                onclick="authenticateTrakt()"
+                style="margin-bottom: 0; flex: 3;"
+              >
+                Login with Trakt.tv
+              </button>
+              <button
+                id="traktDisconnectBtn"
+                class="secondary-button"
+                onclick="disconnectTrakt()"
+                style="margin-bottom: 0; flex: 1; margin-left: 8px; background-color: #8b0000; display: none;"
+              >
+                Disconnect
+              </button>
+            </div>
             <input
               type="hidden"
               id="traktAccessToken"
@@ -824,15 +934,15 @@
             </div>
           </div>
 
-          <div class="form-group">
+          <div class="form-group" id="geminiModelGroup">
             <label class="form-label" for="geminiModel"
               >Gemini Model Name</label
             >
             <input
               type="text"
               id="geminiModel"
-              placeholder="Enter model name (e.g., gemini-2.0-flash-lite)"
-              value="gemini-2.5-flash-lite"
+              placeholder="Enter model name (e.g., gemini-3.1-flash-lite)"
+              value="gemini-3.1-flash-lite"
             />
             <div class="help-text">
               Enter the Gemini model id. See available models at
@@ -842,6 +952,19 @@
               >
                 Gemini Models Documentation
               </a>
+            </div>
+          </div>
+
+          <div class="form-group" id="geminiGroundingGroup">
+            <div class="checkbox-container">
+              <input type="checkbox" id="enableGeminiGrounding" />
+              <label for="enableGeminiGrounding"
+                >Enable Google Search Grounding</label
+              >
+            </div>
+            <div class="help-text">
+              Lets Gemini ground its responses with live Google Search results for more accurate recommendations.
+              <strong>Note:</strong> Free-tier accounts are limited to 20 grounded requests/day. Disable if you hit quota errors.
             </div>
           </div>
 
@@ -860,6 +983,23 @@
             />
             <div class="help-text">
               Higher values may increase response time
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="aiTemperature">AI Temperature</label>
+            <input
+              type="number"
+              id="aiTemperature"
+              placeholder="Default: 0.2"
+              min="0"
+              max="1"
+              step="0.1"
+              value="0.2"
+            />
+            <div class="help-text">
+              Controls randomness. Lower values are more deterministic and tend
+              to follow the required output format more reliably.
             </div>
           </div>
         </div>
@@ -1096,7 +1236,13 @@
 
       // Remove the old key masking functions and setup
       function setupKeyHandling() {
-        const keyInputs = ["geminiKey", "tmdbKey", "rpdbKey", "fanartKey"];
+        const keyInputs = [
+          "geminiKey",
+          "openaiCompatApiKey",
+          "tmdbKey",
+          "rpdbKey",
+          "fanartKey",
+        ];
 
         keyInputs.forEach((inputId) => {
           const input = document.getElementById(inputId);
@@ -1116,13 +1262,44 @@
       });
 
       window.getAddonUrl = async function () {
+        const aiProvider = document.getElementById("aiProvider").value;
         const geminiKey = document.getElementById("geminiKey").value.trim();
+        const openaiCompatApiKey = document
+          .getElementById("openaiCompatApiKey")
+          .value.trim();
+        const openaiCompatModel = document
+          .getElementById("openaiCompatModel")
+          .value.trim();
+        const openaiCompatBaseUrl = document
+          .getElementById("openaiCompatBaseUrl")
+          .value.trim();
+        const openaiCompatExtraHeaders = document
+          .getElementById("openaiCompatExtraHeaders")
+          .value.trim();
         const tmdbKey = document.getElementById("tmdbKey").value.trim();
+        const aiTemperatureRaw = document
+          .getElementById("aiTemperature")
+          .value.trim();
+        const aiTemperatureParsed = parseFloat(aiTemperatureRaw);
+        const aiTemperature = Number.isFinite(aiTemperatureParsed)
+          ? Math.max(0, Math.min(1, aiTemperatureParsed))
+          : 0.2;
         
         // Basic validation
-        if (!geminiKey || geminiKey.length < 10) {
-          showError("Please enter a valid Gemini API key");
-          return null;
+        if (aiProvider === "gemini") {
+          if (!geminiKey || geminiKey.length < 10) {
+            showError("Please enter a valid Gemini API key");
+            return null;
+          }
+        } else {
+          if (!openaiCompatApiKey || openaiCompatApiKey.length < 10) {
+            showError("Please enter a valid OpenAI-compatible API key");
+            return null;
+          }
+          if (!openaiCompatModel) {
+            showError("Please enter a model name");
+            return null;
+          }
         }
         if (!tmdbKey || tmdbKey.length < 10) {
           showError("Please enter a valid TMDB API key");
@@ -1131,7 +1308,16 @@
 
         try {
           setLoading(true);
-          const isValid = await validateApiKeys(geminiKey, tmdbKey);
+          const isValid = await validateApiKeys({
+            aiProvider,
+            geminiKey,
+            openaiCompatApiKey,
+            openaiCompatModel,
+            openaiCompatBaseUrl,
+            openaiCompatExtraHeaders,
+            aiTemperature,
+            tmdbKey,
+          });
           if (!isValid) return null;
           clearError();
 
@@ -1139,19 +1325,30 @@
 
           // 1. Prepare the main configuration object
           const configData = {
-            GeminiApiKey: geminiKey,
+            AiProvider: aiProvider,
             TmdbApiKey: tmdbKey,
             RpdbApiKey: document.getElementById("rpdbKey").value.trim(),
             FanartApiKey: document.getElementById("fanartKey").value.trim(),
             NumResults: parseInt(document.getElementById("numResults").value.trim()) || 20,
+            AiTemperature: aiTemperature,
             EnableAiCache: document.getElementById("enableAiCache").checked,
             TmdbLanguage: document.getElementById("tmdbLanguage").value,
-            GeminiModel: document.getElementById("geminiModel").value,
             EnableRpdb: document.getElementById("enableRpdbPosters").checked,
             EnableHomepage: document.getElementById("enableHomepage").checked,
             IncludeAdult: document.getElementById("includeAdult").checked,
             EnableSimilar: document.getElementById("enableSimilar").checked,
           };
+
+          if (aiProvider === "gemini") {
+            configData.GeminiApiKey = geminiKey;
+            configData.GeminiModel = document.getElementById("geminiModel").value;
+            configData.EnableGeminiGrounding = document.getElementById("enableGeminiGrounding").checked;
+          } else {
+            configData.OpenAICompatApiKey = openaiCompatApiKey;
+            configData.OpenAICompatModel = openaiCompatModel;
+            if (openaiCompatBaseUrl) configData.OpenAICompatBaseUrl = openaiCompatBaseUrl;
+            if (openaiCompatExtraHeaders) configData.OpenAICompatExtraHeaders = openaiCompatExtraHeaders;
+          }
 
           // Add conditional properties
           if (configData.EnableHomepage && document.getElementById("homepageQuery").value.trim()) {
@@ -1211,7 +1408,16 @@
         }
       };
 
-      async function validateApiKeys(geminiKey, tmdbKey) {
+      async function validateApiKeys({
+        aiProvider,
+        geminiKey,
+        openaiCompatApiKey,
+        openaiCompatModel,
+        openaiCompatBaseUrl,
+        openaiCompatExtraHeaders,
+        aiTemperature,
+        tmdbKey,
+      }) {
         const errorDiv = document.getElementById("error");
         const traktAccessToken = document
           .getElementById("traktAccessToken")
@@ -1228,7 +1434,13 @@
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
+              AiProvider: aiProvider,
               GeminiApiKey: geminiKey,
+              OpenAICompatApiKey: openaiCompatApiKey,
+              OpenAICompatModel: openaiCompatModel,
+              OpenAICompatBaseUrl: openaiCompatBaseUrl,
+              OpenAICompatExtraHeaders: openaiCompatExtraHeaders,
+              AiTemperature: typeof aiTemperature === "number" ? aiTemperature : 0.2,
               TmdbApiKey: tmdbKey,
               FanartApiKey: fanartKey,
               TraktAccessToken: traktAccessToken,
@@ -1238,15 +1450,20 @@
 
           const result = await response.json();
 
-          if (!result.gemini || !result.tmdb) {
+          const aiOk = !!(result.ai || result.gemini || result.openaiCompat);
+          if (!aiOk || !result.tmdb) {
             errorDiv.style.display = "block";
-            errorDiv.textContent = Object.values(result.errors).join(". ");
+            errorDiv.textContent = Object.values(result.errors || {}).join(". ");
             return false;
           }
 
           // Show optional API key validation warnings (but don't block submission)
           const warnings = [];
-          
+
+          if (result.warnings && result.warnings.ai) {
+            warnings.push("AI API: " + result.warnings.ai);
+          }
+
           if (fanartKey && !result.fanart) {
             warnings.push("Fanart.tv: " + result.errors.fanart);
           }
@@ -1317,7 +1534,22 @@
       */
 
       // Update input change handlers to not automatically clear errors
+      document.getElementById("aiProvider").addEventListener("change", () => {
+        document.getElementById("manual-url").style.display = "none";
+      });
       document.getElementById("geminiKey").addEventListener("input", () => {
+        document.getElementById("manual-url").style.display = "none";
+      });
+      document.getElementById("openaiCompatApiKey").addEventListener("input", () => {
+        document.getElementById("manual-url").style.display = "none";
+      });
+      document.getElementById("openaiCompatModel").addEventListener("input", () => {
+        document.getElementById("manual-url").style.display = "none";
+      });
+      document.getElementById("openaiCompatBaseUrl").addEventListener("input", () => {
+        document.getElementById("manual-url").style.display = "none";
+      });
+      document.getElementById("openaiCompatExtraHeaders").addEventListener("input", () => {
         document.getElementById("manual-url").style.display = "none";
       });
       document.getElementById("tmdbKey").addEventListener("input", () => {
@@ -1327,6 +1559,9 @@
         document.getElementById("manual-url").style.display = "none";
       });
       document.getElementById("numResults").addEventListener("input", () => {
+        document.getElementById("manual-url").style.display = "none";
+      });
+      document.getElementById("aiTemperature").addEventListener("input", () => {
         document.getElementById("manual-url").style.display = "none";
       });
       // NEW: Add listener for the RPDB enable checkbox
@@ -1361,6 +1596,17 @@
         homepageQueryGroup.style.display = enableHomepage ? 'block' : 'none';
       }
 
+      function toggleAiProviderVisibility() {
+        const provider = document.getElementById("aiProvider").value;
+        const geminiFields = document.getElementById("geminiFields");
+        const openaiCompatFields = document.getElementById("openaiCompatFields");
+        const geminiModelGroup = document.getElementById("geminiModelGroup");
+
+        if (geminiFields) geminiFields.style.display = provider === "gemini" ? "block" : "none";
+        if (openaiCompatFields) openaiCompatFields.style.display = provider === "openai-compat" ? "block" : "none";
+        if (geminiModelGroup) geminiModelGroup.style.display = provider === "gemini" ? "block" : "none";
+      }
+
       // Initialize the advanced section to be hidden on page load
       document.addEventListener("DOMContentLoaded", function () {
         document.getElementById("advancedOptions").style.display = "none";
@@ -1376,6 +1622,10 @@
         // Show/hide homepage query input based on checkbox state
         toggleHomepageQueryVisibility(); // Set initial state on load
         document.getElementById('enableHomepage').addEventListener('change', toggleHomepageQueryVisibility);
+
+        // Show/hide provider-specific fields
+        toggleAiProviderVisibility();
+        document.getElementById("aiProvider").addEventListener("change", toggleAiProviderVisibility);
 
         // Check if we're in edit mode (URL contains a config ID)
         const path = window.location.pathname;
@@ -1427,9 +1677,29 @@
               console.log("Loaded configuration:", config);
 
               // Pre-fill the form with the existing configuration
+              if (config.AiProvider) {
+                document.getElementById("aiProvider").value = config.AiProvider;
+              } else if (config.OpenAICompatApiKey && !config.GeminiApiKey) {
+                // Backwards-compatible detection for configs created before AiProvider existed
+                document.getElementById("aiProvider").value = "openai-compat";
+              }
+              toggleAiProviderVisibility();
+
               if (config.GeminiApiKey)
                 document.getElementById("geminiKey").value =
                   config.GeminiApiKey;
+              if (config.OpenAICompatApiKey)
+                document.getElementById("openaiCompatApiKey").value =
+                  config.OpenAICompatApiKey;
+              if (config.OpenAICompatModel)
+                document.getElementById("openaiCompatModel").value =
+                  config.OpenAICompatModel;
+              if (config.OpenAICompatBaseUrl)
+                document.getElementById("openaiCompatBaseUrl").value =
+                  config.OpenAICompatBaseUrl;
+              if (config.OpenAICompatExtraHeaders)
+                document.getElementById("openaiCompatExtraHeaders").value =
+                  config.OpenAICompatExtraHeaders;
               if (config.TmdbApiKey)
                 document.getElementById("tmdbKey").value = config.TmdbApiKey;
               if (config.RpdbApiKey) {
@@ -1446,12 +1716,17 @@
                   config.TmdbLanguage;
               if (config.NumResults)
                 document.getElementById("numResults").value = config.NumResults;
+              if (config.AiTemperature !== undefined)
+                document.getElementById("aiTemperature").value = config.AiTemperature;
               if (config.EnableAiCache !== undefined)
                 document.getElementById("enableAiCache").checked =
                   config.EnableAiCache;
               if (config.GeminiModel)
                 document.getElementById("geminiModel").value =
                   config.GeminiModel;
+              if (config.EnableGeminiGrounding !== undefined)
+                document.getElementById("enableGeminiGrounding").checked =
+                  config.EnableGeminiGrounding;
               if (config.EnableRpdb !== undefined) {
                 document.getElementById("enableRpdbPosters").checked =
                   config.EnableRpdb;
@@ -1501,6 +1776,7 @@
               if (
                 config.RpdbApiKey ||
                 config.NumResults ||
+                config.AiTemperature !== undefined ||
                 config.EnableAiCache !== undefined ||
                 config.TraktAccessToken ||
                 config.GeminiModel ||
@@ -1539,6 +1815,17 @@ window.addEventListener("message", async function (event) {
         if (event.origin !== window.location.origin) return;
 
         if (event.data.type === "TRAKT_AUTH_SUCCESS") {
+          const expectedState = sessionStorage.getItem("traktOAuthState");
+          if (!expectedState || event.data.state !== expectedState) {
+            console.error("OAuth state mismatch - possible CSRF attempt");
+            updateTraktStatus(
+              "Authentication Error",
+              "#e74c3c",
+              "Security check failed. Please try again."
+            );
+            return;
+          }
+          sessionStorage.removeItem("traktOAuthState");
           const { access_token, refresh_token, expires_in } = event.data;
           
           updateTraktStatus("Fetching user...", "#666", "Getting your Trakt.tv profile...");
@@ -1570,7 +1857,8 @@ window.addEventListener("message", async function (event) {
             updateTraktStatus(
               `Connected as ${username}`,
               "#2a5a2a", // Green color for success
-              `Successfully connected as <strong>${username}</strong>! Click 'Configure Addon' below to save.`
+              `Successfully connected as <strong>${username}</strong>! Click 'Configure Addon' below to save.`,
+              true
             );
           } catch (error) {
             console.error("Trakt user fetch error:", error);
@@ -1591,7 +1879,8 @@ window.addEventListener("message", async function (event) {
             updateTraktStatus(
                 `Connected as ${existingUsername}`,
                 "#2a5a2a", // Green color
-                `Your addon is connected to Trakt.tv as <strong>${existingUsername}</strong>. To change accounts, use the login button again.`
+                `Your addon is connected to Trakt.tv as <strong>${existingUsername}</strong>. To change accounts, use the login button again.`,
+                true
             );
             return;
         }
@@ -1606,11 +1895,12 @@ window.addEventListener("message", async function (event) {
         }
       }
 
-      function updateTraktStatus(buttonText, buttonColor, helpText) {
+      function updateTraktStatus(buttonText, buttonColor, helpText, connected = false) {
         const traktAuthBtn = document.getElementById("traktAuthBtn");
         const traktHelpText = document.querySelector(
           ".form-group:has(#traktAuthBtn) .help-text"
         );
+        const traktDisconnectBtn = document.getElementById("traktDisconnectBtn");
 
         if (traktAuthBtn) {
           traktAuthBtn.textContent = buttonText;
@@ -1620,6 +1910,23 @@ window.addEventListener("message", async function (event) {
         if (traktHelpText) {
           traktHelpText.innerHTML = helpText;
         }
+
+        if (traktDisconnectBtn) {
+          traktDisconnectBtn.style.display = connected ? "inline-block" : "none";
+        }
+      }
+
+      function disconnectTrakt() {
+        document.getElementById("traktAccessToken").value = "";
+        document.getElementById("traktRefreshToken").value = "";
+        document.getElementById("traktUsername").value = "";
+        document.getElementById("traktExpiresIn").value = "";
+        updateTraktStatus(
+          "Login with Trakt.tv",
+          "#2a2a2a",
+          "Connect your Trakt.tv account to get personalized movie recommendations based on your watch history and ratings.<br><small>Note: You'll need to re-authenticate every 90 days for security reasons.</small>",
+          false
+        );
       }
 
       async function authenticateTrakt() {
@@ -1636,6 +1943,7 @@ window.addEventListener("message", async function (event) {
           geminiModel: document.getElementById("geminiModel").value,
           traktAccessToken: document.getElementById("traktAccessToken").value,
           traktRefreshToken: document.getElementById("traktRefreshToken").value,
+          traktExpiresIn: document.getElementById("traktExpiresIn").value,
           enableRpdbPosters:
             document.getElementById("enableRpdbPosters").checked,
           enableHomepage: document.getElementById("enableHomepage").checked,
@@ -1644,7 +1952,7 @@ window.addEventListener("message", async function (event) {
         };
         sessionStorage.setItem("formData", JSON.stringify(formData));
 
-        const redirectUri = `${window.location.origin}/aisearch/oauth/callback`;
+        const redirectUri = `https://${HOST}/aisearch/oauth/callback`;
         const state = Math.random().toString(36).substring(7);
         sessionStorage.setItem("traktOAuthState", state);
 
@@ -1707,6 +2015,10 @@ window.addEventListener("message", async function (event) {
             if (formData.traktRefreshToken) {
               document.getElementById("traktRefreshToken").value =
                 formData.traktRefreshToken;
+            }
+            if (formData.traktExpiresIn) {
+              document.getElementById("traktExpiresIn").value =
+                formData.traktExpiresIn;
             }
             setTimeout(validateAndRefreshTraktToken, 100);
           }

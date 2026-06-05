@@ -118,9 +118,10 @@ const logger = {
     }
   },
   error: function (message, data) {
-    if (ENABLE_LOGGING) {
-      writeLog("ERROR", message, data);
-    }
+    // Errors always log regardless of ENABLE_LOGGING
+    writeLog("ERROR", message, data);
+    const formattedData = data ? ` ${JSON.stringify(data)}` : "";
+    console.error(`[ERROR] ${message}${formattedData}`);
   },
   query: logQuery, // Add the query logger to the logger object
   emptyCatalog: function (reason, data = {}) {

@@ -25,6 +25,10 @@ const path = require("path");
 const logger = require("./utils/logger");
 const { handleIssueSubmission } = require("./utils/issueHandler");
 const {
+  createAiTextGenerator,
+  getAiProviderConfigFromConfig,
+} = require("./utils/aiProvider");
+const {
   encryptConfig,
   decryptConfig,
   isValidEncryptedFormat,
@@ -259,7 +263,13 @@ async function refreshTraktToken(username, refreshToken) {
   try {
     const response = await fetch("https://api.trakt.tv/oauth/token", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "StremioAISearch/1.0 (https://github.com/itcon-pty-au/stremio-ai-search)",
+        "trakt-api-version": "2",
+        "trakt-api-key": process.env.TRAKT_CLIENT_ID,
+      },
       body: JSON.stringify({
         refresh_token: refreshToken,
         client_id: process.env.TRAKT_CLIENT_ID,
@@ -635,7 +645,7 @@ async function startServer() {
                 let tokenData = await getTokens(decryptedConfig.traktUsername);
                 if (tokenData) {
                   // Check if token is expired (with a 5-minute buffer)
-                  if (tokenData.expires_at < Date.now() - 5 * 60 * 1000) {
+                  if (tokenData.expires_at < Date.now() + 5 * 60 * 1000) {
                     const newTokens = await refreshTraktToken(decryptedConfig.traktUsername, tokenData.refresh_token);
                     if (newTokens) {
                       decryptedConfig.TraktAccessToken = newTokens.access_token;
@@ -836,6 +846,10 @@ async function startServer() {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "StremioAISearch/1.0 (https://github.com/itcon-pty-au/stremio-ai-search)",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
               },
               body: JSON.stringify({
                 code,
@@ -848,10 +862,21 @@ async function startServer() {
           );
 
           if (!tokenResponse.ok) {
-            throw new Error("Failed to exchange code for token");
+            const errBody = await tokenResponse.text().catch(() => "");
+            throw new Error(
+              `Failed to exchange code for token (HTTP ${tokenResponse.status})${errBody ? `: ${errBody}` : ""}`
+            );
           }
 
           const tokenData = await tokenResponse.json();
+
+          const safePayload = JSON.stringify({
+            type: "TRAKT_AUTH_SUCCESS",
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token,
+            expires_in: tokenData.expires_in,
+            state: state || "",
+          });
 
           // Send the token data back to the parent window
           res.send(`
@@ -861,15 +886,10 @@ async function startServer() {
                 <p>You can close this window now.</p>
                 <script>
                   if (window.opener) {
-                    window.opener.postMessage({
-                      type: "TRAKT_AUTH_SUCCESS",
-                      access_token: "${tokenData.access_token}",
-                      refresh_token: "${tokenData.refresh_token}",
-                      expires_in: ${tokenData.expires_in}
-                    }, "${HOST}");
+                    window.opener.postMessage(${safePayload}, "${HOST}");
                     window.close();
                   }
-                </script>
+                <\/script>
               </body>
             </html>
           `);
@@ -878,7 +898,17 @@ async function startServer() {
             error: error.message,
             stack: error.stack,
           });
-          res.status(500).send("Error during OAuth callback");
+          const safeMessage = (error.message || "Unknown error").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          res.status(500).send(`
+            <html>
+              <body style="background: #141414; color: #d9d9d9; font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+                <h2 style="color: #e74c3c;">Authentication Failed</h2>
+                <p style="color: #aaa; font-size: 14px;">Could not complete Trakt.tv authentication.</p>
+                <pre style="background: #1f1f1f; color: #f39c12; padding: 12px; border-radius: 6px; font-size: 12px; text-align: left; white-space: pre-wrap; word-break: break-word;">${safeMessage}</pre>
+                <button onclick="window.close()" style="margin-top: 16px; padding: 8px 20px; background: #666; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Close</button>
+              </body>
+            </html>
+          `);
         }
       });
 
@@ -1337,43 +1367,6 @@ async function startServer() {
         `);
       });
 
-      // Update Trakt.tv token refresh endpoint to use pre-configured credentials
-      addonRouter.post("/oauth/refresh", async (req, res) => {
-        try {
-          const { refresh_token } = req.body;
-
-          if (!refresh_token) {
-            return res.status(400).json({ error: "Missing refresh token" });
-          }
-
-          const response = await fetch("https://api.trakt.tv/oauth/token", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              refresh_token,
-              client_id: TRAKT_CLIENT_ID,
-              client_secret: TRAKT_CLIENT_SECRET,
-              redirect_uri: `${HOST}/aisearch/oauth/callback`,
-              grant_type: "refresh_token",
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error("Failed to refresh token");
-          }
-
-          const tokenData = await response.json();
-          res.json(tokenData);
-        } catch (error) {
-          logger.error("Token refresh error:", {
-            error: error.message,
-            stack: error.stack,
-          });
-          res.status(500).json({ error: "Failed to refresh token" });
-        }
-      });
     });
 
     app.use("/", addonRouter);
@@ -1483,28 +1476,31 @@ app.post(["/validate", "/aisearch/validate"], express.json(), async (req, res) =
   const startTime = Date.now();
   try {
     const {
-      GeminiApiKey,
       TmdbApiKey,
-      GeminiModel,
       TraktAccessToken,
       FanartApiKey,
       traktUsername,
     } = req.body;
     
     const validationResults = {
+      ai: false,
+      aiProvider: null,
       gemini: false,
+      openaiCompat: false,
       tmdb: false,
       fanart: true, // Optional, so default to true
       trakt: true,
       errors: {},
     };
     
-    const modelToUse = GeminiModel || "gemini-2.5-flash-lite";
+    const aiProviderConfig = getAiProviderConfigFromConfig(req.body);
+    validationResults.aiProvider = aiProviderConfig.provider;
 
     if (ENABLE_LOGGING) {
       logger.debug("Validation request received", {
         path: req.path,
-        hasGeminiKey: !!GeminiApiKey,
+        aiProvider: aiProviderConfig.provider,
+        hasAiKey: !!aiProviderConfig.apiKey,
         hasTmdbKey: !!TmdbApiKey,
         hasTraktToken: !!TraktAccessToken,
         hasTraktUsername: !!traktUsername,
@@ -1513,26 +1509,48 @@ app.post(["/validate", "/aisearch/validate"], express.json(), async (req, res) =
 
     const validations = [];
 
-    // Gemini Validation
-    if (GeminiApiKey) {
+    // AI Provider Validation (Gemini or OpenAI-compatible)
+    if (aiProviderConfig.apiKey) {
       validations.push((async () => {
         try {
-          const { GoogleGenerativeAI } = require("@google/generative-ai");
-          const genAI = new GoogleGenerativeAI(GeminiApiKey);
-          const model = genAI.getGenerativeModel({ model: modelToUse });
-          const result = await model.generateContent("Test prompt");
-          const responseText = result.response.text();
-          if (responseText.length > 0) {
-            validationResults.gemini = true;
+          const aiClient = createAiTextGenerator(aiProviderConfig);
+          const responseText = await aiClient.generateText("Test prompt");
+          if (responseText && responseText.length > 0) {
+            validationResults.ai = true;
+            if (aiProviderConfig.provider === "gemini") {
+              validationResults.gemini = true;
+            } else {
+              validationResults.openaiCompat = true;
+            }
           } else {
-            validationResults.errors.gemini = "Invalid Gemini API key - No response";
+            validationResults.errors.ai = "Invalid AI provider API key - No response";
           }
         } catch (error) {
-          validationResults.errors.gemini = `Invalid Gemini API key: ${error.message}`;
+          const isQuotaError =
+            error.status === 429 ||
+            (error.message && error.message.includes("429")) ||
+            (error.message && /quota|rate.?limit/i.test(error.message));
+          if (isQuotaError) {
+            // 429 means the key IS valid — just rate limited. Don't block installation.
+            validationResults.ai = true;
+            if (aiProviderConfig.provider === "gemini") {
+              validationResults.gemini = true;
+            } else {
+              validationResults.openaiCompat = true;
+            }
+            validationResults.warnings = validationResults.warnings || {};
+            validationResults.warnings.ai = "API key is valid but the quota is currently exceeded. The addon will work once the rate limit resets.";
+          } else {
+            validationResults.errors.ai = `Invalid AI provider API key: ${error.message}`;
+          }
         }
       })());
     } else {
-       validationResults.errors.gemini = "Gemini API Key is required.";
+      if (aiProviderConfig.provider === "openai-compat") {
+        validationResults.errors.ai = "OpenAI-compatible API key is required.";
+      } else {
+        validationResults.errors.ai = "Gemini API Key is required.";
+      }
     }
 
     // TMDB Validation

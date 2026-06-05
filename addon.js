@@ -5,6 +5,10 @@ const logger = require("./utils/logger");
 const path = require("path");
 const { decryptConfig } = require("./utils/crypto");
 const { withRetry } = require("./utils/apiRetry");
+const {
+  createAiTextGenerator,
+  getAiProviderConfigFromConfig,
+} = require("./utils/aiProvider");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 day cache for TMDB
 const TMDB_DISCOVER_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 day cache for TMDB discover (was 12 hours)
@@ -240,7 +244,7 @@ setInterval(() => {
   });
 }, 60 * 60 * 1000);
 
-const DEFAULT_GEMINI_MODEL = "gemini-2.0-flash-lite";
+const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 // Add separate caches for raw and processed Trakt data
 const traktRawDataCache = new SimpleLRUCache({
@@ -638,7 +642,7 @@ async function fetchTraktWatchedAndRated(
       },
       {
         maxRetries: 3,
-        baseDelay: 1000,
+        initialDelay: 1000,
         shouldRetry: (error) => !error.status || (error.status !== 401 && error.status !== 403),
         operationName: "Trakt API call"
       }
@@ -1708,7 +1712,7 @@ async function fetchFanartThumbnail(imdbId, fanartApiKey) {
       },
       {
         maxRetries: 3,
-        baseDelay: 1000,
+        initialDelay: 1000,
         shouldRetry: (error) => !error.status || error.status !== 401,
         operationName: "Fanart.tv API call"
       }
@@ -2448,14 +2452,10 @@ function deserializeAllCaches(data) {
 /**
  * Makes an AI call to determine the content type and genres for a recommendation query
  * @param {string} query - The user's search query
- * @param {string} geminiKey - The Gemini API key
- * @param {string} geminiModel - The Gemini model to use
+ * @param {{ provider: string, model: string, generateText: (prompt: string) => Promise<string> }} aiClient
  * @returns {Promise<{type: string, genres: string[]}>} - The discovered type and genres
  */
-async function discoverTypeAndGenres(query, geminiKey, geminiModel) {
-  const genAI = new GoogleGenerativeAI(geminiKey);
-  const model = genAI.getGenerativeModel({ model: geminiModel });
-
+async function discoverTypeAndGenres(query, aiClient) {
   const promptText = `
 Analyze this recommendation query: "${query}"
 
@@ -2484,35 +2484,27 @@ Do not include any explanatory text before or after your response. Just the sing
   try {
     logger.info("Making genre discovery API call", {
       query,
-      model: geminiModel,
+      provider: aiClient?.provider,
+      model: aiClient?.model,
     });
 
-    // Use withRetry for the Gemini API call
+    // Use withRetry for the AI API call
     const text = await withRetry(
       async () => {
         try {
-          const aiResult = await model.generateContent(promptText);
-          const response = await aiResult.response;
-          const responseText = response.text().trim();
-
-          // Log successful response with more details
+          const responseText = await aiClient.generateText(promptText);
           logger.info("Genre discovery API response", {
-            promptTokens: aiResult.promptFeedback?.tokenCount,
-            candidates: aiResult.candidates?.length,
-            safetyRatings: aiResult.candidates?.[0]?.safetyRatings,
             responseTextLength: responseText.length,
             responseTextSample: responseText,
           });
-
           return responseText;
         } catch (error) {
-          // Enhance error with status for retry logic
           logger.error("Genre discovery API call failed", {
             error: error.message,
-            status: error.httpStatus || 500,
+            status: error.status || error.httpStatus || 500,
             stack: error.stack,
           });
-          error.status = error.httpStatus || 500;
+          error.status = error.status || error.httpStatus || 500;
           throw error;
         }
       },
@@ -2522,7 +2514,7 @@ Do not include any explanatory text before or after your response. Just the sing
         maxDelay: 10000,
         // Don't retry 400 errors (bad requests)
         shouldRetry: (error) => !error.status || error.status !== 400,
-        operationName: "Genre discovery API call",
+        operationName: "AI genre discovery call",
       }
     );
 
@@ -2686,6 +2678,24 @@ function getRpdbTierFromApiKey(apiKey) {
   }
 }
 
+/**
+ * Runs an array of async tasks with a maximum concurrency limit.
+ * Prevents simultaneous API calls from overwhelming rate limits.
+ */
+async function limitedPromiseAll(tasks, concurrency = 8) {
+  const results = new Array(tasks.length);
+  let index = 0;
+  async function worker() {
+    while (index < tasks.length) {
+      const i = index++;
+      results[i] = await tasks[i]();
+    }
+  }
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 const catalogHandler = async function (args, req) {
   const startTime = Date.now();
   const { id, type, extra } = args;
@@ -2700,8 +2710,21 @@ const catalogHandler = async function (args, req) {
       return { metas: [errorMeta] };
     }
 
-    const geminiKey = configData.GeminiApiKey;
     const tmdbKey = configData.TmdbApiKey;
+    const aiProviderConfig = getAiProviderConfigFromConfig(configData);
+    const aiApiKey = aiProviderConfig.apiKey;
+    let aiClient;
+
+    try {
+      aiClient = createAiTextGenerator(aiProviderConfig);
+    } catch (error) {
+      logger.error("AI provider configuration error", { error: error.message });
+      const errorMeta = createErrorMeta(
+        "AI Provider Configuration Error",
+        "The selected AI provider is misconfigured. Please review your addon settings."
+      );
+      return { metas: [errorMeta] };
+    }
 
     if (configData.traktConnectionError) {
       logger.error('Trakt Connection Failed', { reason: 'User access to Trakt.tv has expired or was revoked.' });
@@ -2720,9 +2743,18 @@ const catalogHandler = async function (args, req) {
       const errorMeta = createErrorMeta('TMDB API Key Invalid', `The key failed validation (Status: ${tmdbResponse.status}). Please check your TMDB key in the addon settings.`);
       return { metas: [errorMeta] };
     }
-    if (!geminiKey || geminiKey.length < 10) {
-      logger.error('Gemini API Key Invalid', { reason: 'Your Gemini API key is missing or invalid.' });
-      const errorMeta = createErrorMeta('Gemini API Key Invalid', 'Your Gemini API key is missing or invalid. Please correct it in the addon settings.');
+    if (!aiApiKey || aiApiKey.length < 10) {
+      const providerName =
+        aiProviderConfig.provider === "openai-compat"
+          ? "OpenAI-Compatible"
+          : "Gemini";
+      logger.error(`${providerName} API Key Invalid`, {
+        reason: `Your ${providerName} API key is missing or invalid.`,
+      });
+      const errorMeta = createErrorMeta(
+        `${providerName} API Key Invalid`,
+        `Your ${providerName} API key is missing or invalid. Please correct it in the addon settings.`
+      );
       return { metas: [errorMeta] };
     }
 
@@ -2790,16 +2822,14 @@ const catalogHandler = async function (args, req) {
       traktAccessTokenLength: configData.TraktAccessToken?.length || 0,
     });
 
-    const geminiModel = configData.GeminiModel || DEFAULT_GEMINI_MODEL;
+    const aiModel = aiProviderConfig.model;
     const language = configData.TmdbLanguage || "en-US";
 
-    if (!geminiKey || geminiKey.length < 10) {
-      logger.error("Invalid or missing Gemini API key");
-      return {
-        metas: [],
-        error:
-          "Invalid Gemini API key. Please reconfigure the addon with a valid key.",
-      };
+    if (!aiApiKey || aiApiKey.length < 10) {
+      logger.error("Invalid or missing AI provider API key", {
+        aiProvider: aiProviderConfig.provider,
+      });
+      return { metas: [], error: "Invalid AI provider API key. Please reconfigure the addon with a valid key." };
     }
 
     if (!tmdbKey || tmdbKey.length < 10) {
@@ -2830,7 +2860,8 @@ const catalogHandler = async function (args, req) {
         numResults,
         rawNumResults: configData.NumResults,
         type,
-        hasGeminiKey: !!geminiKey,
+        aiProvider: aiProviderConfig.provider,
+        hasAiKey: !!aiApiKey,
         hasTmdbKey: !!tmdbKey,
         hasRpdbKey: !!rpdbKey,
         isDefaultRpdbKey: rpdbKey === DEFAULT_RPDB_KEY,
@@ -2838,14 +2869,14 @@ const catalogHandler = async function (args, req) {
         enableAiCache: enableAiCache,
         enableRpdb: enableRpdb,
         includeAdult: includeAdult,
-        geminiModel: geminiModel,
+        aiModel: aiModel,
         language: language,
         hasTraktClientId: !!DEFAULT_TRAKT_CLIENT_ID,
         hasTraktAccessToken: !!configData.TraktAccessToken,
       });
     }
 
-    if (!geminiKey || !tmdbKey) {
+    if (!aiApiKey || !tmdbKey) {
       logger.error("Missing API keys in catalog handler");
       logger.emptyCatalog("Missing API keys", { type, extra });
       return { metas: [] };
@@ -2945,13 +2976,29 @@ const catalogHandler = async function (args, req) {
     // For recommendation queries, use the new workflow with genre discovery
     if (isRecommendation) {
 
-      // Make the genre discovery API call
-      const discoveryResult = await discoverTypeAndGenres(
-        searchQuery,
-        geminiKey,
-        geminiModel
-      );
-      discoveredGenres = discoveryResult.genres;
+      const hasTraktConfig = !!(DEFAULT_TRAKT_CLIENT_ID && configData.TraktAccessToken);
+
+      if (hasTraktConfig) {
+        // Genre discovery is only needed to filter Trakt data — run both in parallel.
+        logger.info("Fetching Trakt data and discovering genres in parallel", {
+          hasTraktClientId: !!DEFAULT_TRAKT_CLIENT_ID,
+          hasTraktAccessToken: !!configData.TraktAccessToken,
+          query: searchQuery,
+        });
+
+        const [discoveryResult, rawTraktData] = await Promise.all([
+          discoverTypeAndGenres(searchQuery, aiClient),
+          fetchTraktWatchedAndRated(
+            DEFAULT_TRAKT_CLIENT_ID,
+            configData.TraktAccessToken,
+            type === "movie" ? "movies" : "shows",
+            configData
+          ),
+        ]);
+
+        discoveredGenres = discoveryResult.genres;
+        traktData = rawTraktData;
+      }
 
       // Log if we couldn't discover any genres for a recommendation query
       if (discoveredGenres.length === 0) {
@@ -2970,27 +3017,10 @@ const catalogHandler = async function (args, req) {
         originalType: type,
       });
 
-      // If Trakt is configured, get user data ONLY for recommendation queries
-      if (DEFAULT_TRAKT_CLIENT_ID && configData.TraktAccessToken) {
-        logger.info("Fetching Trakt data for recommendation query", {
-          hasTraktClientId: !!DEFAULT_TRAKT_CLIENT_ID,
-          traktClientIdLength: DEFAULT_TRAKT_CLIENT_ID?.length,
-          hasTraktAccessToken: !!configData.TraktAccessToken,
-          traktAccessTokenLength: configData.TraktAccessToken?.length,
-          isRecommendation: isRecommendation,
-          query: searchQuery,
-        });
-
-        traktData = await fetchTraktWatchedAndRated(
-          DEFAULT_TRAKT_CLIENT_ID,
-          configData.TraktAccessToken,
-          type === "movie" ? "movies" : "shows",
-          configData
-        );
+      if (traktData) {
 
         // Filter Trakt data based on discovered genres if we have any
-        if (traktData) {
-          if (discoveredGenres.length > 0) {
+        if (discoveredGenres.length > 0) {
             filteredTraktData = filterTraktDataByGenres(
               traktData,
               discoveredGenres
@@ -3019,7 +3049,7 @@ const catalogHandler = async function (args, req) {
                 });
               }
             }
-          } else {
+        } else {
             // When no genres are discovered, use all Trakt data
             filteredTraktData = {
               recentlyWatched: traktData.watched?.slice(0, 100) || [],
@@ -3042,7 +3072,6 @@ const catalogHandler = async function (args, req) {
               }
             );
           }
-        }
       }
     }
 
@@ -3063,7 +3092,7 @@ const catalogHandler = async function (args, req) {
         cacheKey,
         query: searchQuery,
         type,
-        model: geminiModel,
+        model: aiModel,
         cachedAt: new Date(cached.timestamp).toISOString(),
         age: `${Math.round((Date.now() - cached.timestamp) / 1000)}s`,
         responseTime: `${Date.now() - startTime}ms`,
@@ -3105,14 +3134,14 @@ const catalogHandler = async function (args, req) {
           logger.error("AI returned no valid recommendations", { 
             query: searchQuery, 
             type: type,
-            model: geminiModel,
+            model: aiModel,
             responseText: text
           });
           const errorMeta = createErrorMeta('No Results Found', 'The AI could not find any recommendations for your query. Please try rephrasing your search.');
-          return { metas: [errorMeta] };
+          return { metas: [] };
         }
 
-        const metaPromises = selectedRecommendations.map((item) =>
+        const metaPromises = selectedRecommendations.map((item) => () =>
           toStremioMeta(
             item,
             platform,
@@ -3125,7 +3154,7 @@ const catalogHandler = async function (args, req) {
           )
         );
 
-        const metas = (await Promise.all(metaPromises)).filter(Boolean);
+        const metas = (await limitedPromiseAll(metaPromises)).filter(Boolean);
 
         if (metas.length === 0 && !exactMatchMeta) {
           logger.error("All AI recommendations failed TMDB lookup", {
@@ -3159,7 +3188,7 @@ const catalogHandler = async function (args, req) {
         if (finalMetas.length === 0) {
             logger.error("No results found for query (from cache)", { query: searchQuery, type: type });
             const errorMeta = createErrorMeta('No Results Found', 'The AI could not find any recommendations for your query. Please try rephrasing your search.');
-            return { metas: [errorMeta] };
+            return { metas: [] };
         }
 
         // Increment counter for successful cached results
@@ -3200,8 +3229,6 @@ const catalogHandler = async function (args, req) {
     }
 
     try {
-      const genAI = new GoogleGenerativeAI(geminiKey);
-      const model = genAI.getGenerativeModel({ model: geminiModel });
       const genreCriteria = extractGenreCriteria(searchQuery);
       const currentYear = new Date().getFullYear();
 
@@ -3434,6 +3461,9 @@ const catalogHandler = async function (args, req) {
         "SPECIFIC QUERY HANDLING:",
         "First, determine if the query matches one of the types below. If it does, follow its rules precisely.",
         "",
+        `0. EXACT TITLE LOOKUP: If the query appears to be the specific name of a single movie or TV show (e.g., 'Inception', 'The Godfather', 'Breaking Bad', 'Parasite') — rather than a genre, mood, theme, or person — you MUST include that exact title as the FIRST result, regardless of your quality judgment. After the exact title, fill the remaining slots with closely related or similar content.`,
+        `   - The user searched for this title directly; omitting it is always wrong.`,
+        "",
         `1. FRANCHISE/SERIES: If the query is for a specific title that is part of a larger series (e.g., 'Shrek', 'The Matrix Reloaded', 'Harry Potter', 'star wars', 'Jurassic Park') or explicitly asks for a franchise ('James Bond movies'), ${franchiseInstruction}`,
         `   - List them first, in STRICT chronological order of release.`,
         `   - After listing the entire franchise, if you need more results to reach the count of ${numResults}, you may add official spin-offs or highly similar titles.`,
@@ -3446,6 +3476,12 @@ const catalogHandler = async function (args, req) {
         `   - Order these results by their relevance to the query.`,
         "CRITICAL REQUIREMENTS:",
         `- You MUST use the Google Search tool to find ALL recommendations. Your internal knowledge is outdated and should only be used in conjunction with Google search tool for this task.`,]);
+        if (isHomepageQuery) {
+          const rotationBucket = Math.floor(Math.random() * 50) + 1;
+          promptText.push(
+            `- VARIETY REQUIREMENT: This is a homepage recommendation shown repeatedly to the user. You MUST provide a fresh, diverse selection. Rotation key: ${rotationBucket}. Do NOT default to the same well-known titles you would typically recommend first — explore the full spectrum of excellent ${type}s matching this query, including lesser-known gems, international titles, and titles from different eras.`
+          );
+        }
         if (traktData) {
           promptText.push(
             `- DO NOT recommend any content that appears in the user's watch history or ratings above.`,
@@ -3454,7 +3490,7 @@ const catalogHandler = async function (args, req) {
         }
         promptText = promptText.concat([
         `- You MUST return upto ${numResults} ${type} recommendations. If you can't find enough perfect matches, broaden your criteria while staying within the genre/theme requirements.`,
-        `- Prioritize quality over exact matching - it's better to recommend a great content that's somewhat related than a mediocre content that perfectly matches all criteria.`,
+        `- Prioritize quality over exact matching for genre/theme/mood queries — but if the query looks like a specific title, that exact title MUST appear first in your results.`,
         `- If the user has watched many content in the requested genre, consider recommending lesser-known gems, international films, or recent releases they might have missed.`,
         "",
         "RESPONSE FORMAT: You MUST respond in the following format (without any additional commentary):",
@@ -3492,8 +3528,9 @@ const catalogHandler = async function (args, req) {
 
       promptText = promptText.join("\n");
 
-      logger.info("Making Gemini API call", {
-        model: geminiModel,
+      logger.info("Making AI API call", {
+        provider: aiClient.provider,
+        model: aiModel,
         query: searchQuery,
         type,
         prompt: promptText,
@@ -3501,19 +3538,13 @@ const catalogHandler = async function (args, req) {
         numResults,
       });
 
-      // Use withRetry for the Gemini API call
+      // Use withRetry for the AI API call
       const text = await withRetry(
         async () => {
           try {
-            const aiResult = await model.generateContent(promptText);
-            const response = await aiResult.response;
-            const responseText = response.text().trim();
-
-            logger.info("Gemini API response", {
+            const responseText = await aiClient.generateText(promptText);
+            logger.info("AI API response", {
               duration: `${Date.now() - startTime}ms`,
-              promptTokens: aiResult.promptFeedback?.tokenCount,
-              candidates: aiResult.candidates?.length,
-              safetyRatings: aiResult.candidates?.[0]?.safetyRatings,
               responseTextLength: responseText.length,
               responseTextSample:
                 responseText.substring(0, 100) +
@@ -3522,12 +3553,12 @@ const catalogHandler = async function (args, req) {
 
             return responseText;
           } catch (error) {
-            logger.error("Gemini API call failed", {
+            logger.error("AI API call failed", {
               error: error.message,
-              status: error.httpStatus || 500,
+              status: error.status || error.httpStatus || 500,
               stack: error.stack,
             });
-            error.status = error.httpStatus || 500;
+            error.status = error.status || error.httpStatus || 500;
             throw error;
           }
         },
@@ -3537,7 +3568,7 @@ const catalogHandler = async function (args, req) {
           maxDelay: 10000,
           // Don't retry 400 errors (bad requests)
           shouldRetry: (error) => !error.status || error.status !== 400,
-          operationName: "Gemini API call",
+          operationName: "AI API call",
         }
       );
 
@@ -3808,7 +3839,7 @@ const catalogHandler = async function (args, req) {
         })),
       });
 
-      const metaPromises = selectedRecommendations.map((item) =>
+      const metaPromises = selectedRecommendations.map((item) => () =>
         toStremioMeta(
           item,
           platform,
@@ -3820,7 +3851,7 @@ const catalogHandler = async function (args, req) {
         )
       );
 
-      const metas = (await Promise.all(metaPromises)).filter(Boolean);
+      const metas = (await limitedPromiseAll(metaPromises)).filter(Boolean);
 
       // Log detailed results
       logger.debug("Meta conversion results", {
@@ -3867,7 +3898,7 @@ const catalogHandler = async function (args, req) {
       if (finalMetas.length === 0) {
           logger.error("No results found for query (from live API call)", { query: searchQuery, type: type });
           const errorMeta = createErrorMeta('No Results Found', 'The AI could not find any recommendations for your query. Please try rephrasing your search.');
-          return { metas: [errorMeta] };
+          return { metas: [] };
       }
 
       // Only increment the counter if we're returning non-empty results
@@ -3881,14 +3912,44 @@ const catalogHandler = async function (args, req) {
 
       return { metas: finalMetas };
     } catch (error) {
-      logger.error("Gemini API Error:", { error: error.message, stack: error.stack, query: searchQuery });
+      logger.error("AI API Error:", {
+        error: error.message,
+        status: error.status || error.httpStatus,
+        stack: error.stack,
+        query: searchQuery,
+        aiProvider: aiProviderConfig?.provider,
+      });
       let errorMessage = 'The AI model failed to respond. This may be a temporary issue.';
-      if (error.message.includes('400') || error.message.includes('API key not valid')) {
-        errorMessage = 'Your Gemini API key is invalid or has been revoked. Please update it in the settings.';
-      } else if (error.message.includes('quota')) {
-        errorMessage = 'You have exceeded your Gemini API quota for the day. Please check your Google AI Studio account.';
-      } else if (error.message.includes('404')) {
-          errorMessage = 'The selected Gemini Model is invalid or not found. Please try a different model in the settings.';
+
+      const status = error.status || error.httpStatus;
+      const provider = aiProviderConfig?.provider;
+
+      const isAuthError =
+        status === 401 ||
+        status === 403 ||
+        (typeof error.message === "string" &&
+          /api key|unauthorized|forbidden/i.test(error.message));
+      const isRateLimit =
+        status === 429 ||
+        (typeof error.message === "string" && /quota|rate limit/i.test(error.message));
+      const isNotFound =
+        status === 404 || (typeof error.message === "string" && /not found/i.test(error.message));
+
+      if (isAuthError) {
+        errorMessage =
+          provider === "openai-compat"
+            ? "Your OpenAI-compatible API key is invalid or has been revoked. Please update it in the settings."
+            : "Your Gemini API key is invalid or has been revoked. Please update it in the settings.";
+      } else if (isRateLimit) {
+        errorMessage =
+          provider === "openai-compat"
+            ? "You have exceeded your OpenAI-compatible provider quota/rate limit. Please check your provider account."
+            : "You have exceeded your Gemini API quota for the day. Please check your Google AI Studio account.";
+      } else if (isNotFound) {
+        errorMessage =
+          provider === "openai-compat"
+            ? "The selected model was not found. Please try a different model name in the settings."
+            : "The selected Gemini Model is invalid or not found. Please try a different model in the settings.";
       }
       const errorMeta = createErrorMeta('AI Error', errorMessage);
       return { metas: [errorMeta] };
@@ -3950,12 +4011,36 @@ const metaHandler = async function (args) {
         throw new Error("Failed to decrypt config data in metaHandler");
       }
       const configData = JSON.parse(decryptedConfigStr);
-      const { GeminiApiKey, TmdbApiKey, GeminiModel, NumResults, RpdbApiKey, RpdbPosterType, TmdbLanguage, FanartApiKey } = configData;
+      const { TmdbApiKey, NumResults, FanartApiKey } = configData;
+      const aiProviderConfig = getAiProviderConfigFromConfig(configData);
+      const aiClient = createAiTextGenerator(aiProviderConfig);
+
+      // Try to fetch Trakt data for personalization (silently skip on any error)
+      let traktData = null;
+      if (DEFAULT_TRAKT_CLIENT_ID && configData.TraktAccessToken) {
+        try {
+          traktData = await fetchTraktWatchedAndRated(
+            DEFAULT_TRAKT_CLIENT_ID,
+            configData.TraktAccessToken,
+            type === 'movie' ? 'movies' : 'shows',
+            configData
+          );
+          if (traktData) {
+            logger.info("Trakt data loaded for similar content personalization", {
+              watchedCount: traktData.watched?.length || 0,
+              ratedCount: traktData.rated?.length || 0,
+            });
+          }
+        } catch (traktError) {
+          logger.warn("Trakt fetch failed for similar content, skipping personalization", { error: traktError.message });
+        }
+      }
 
       const originalId = id.split(':')[1];
       
-      // Check similar content cache first
+      // Check similar content cache first (skip when Trakt active — results are personalized)
       const cacheKey = `similar_${originalId}_${type}_${NumResults || 15}`;
+      if (!traktData) {
       const cached = similarContentCache.get(cacheKey);
       if (cached) {
         logger.debug("Similar content cache hit", { 
@@ -3967,6 +4052,7 @@ const metaHandler = async function (args) {
         });
         return { meta: cached.data };
       }
+      } // end !traktData cache check
       
       logger.debug("Similar content cache miss", { originalId, type, cacheKey });
       let sourceDetails = await getTmdbDetailsByImdbId(originalId, type, TmdbApiKey);
@@ -4002,6 +4088,13 @@ const metaHandler = async function (args) {
       **CRITICAL RULES:**
       1.  **Exclusion:** You **MUST NOT** include the original item, "${sourceTitle} (${sourceYear})", in your list.
       2.  **Final Output:** Provide **ONLY** the combined list of recommendations. Do not include any headers (like "PART 1"), introductory text, or explanations.
+      ${traktData ? `
+      **PERSONALIZATION — ALREADY WATCHED (DO NOT include any of these in your recommendations):**
+      ${(traktData.watched || []).slice(0, 100).map(item => { const m = item.movie || item.show; return m ? `- ${m.title} (${m.year})` : null; }).filter(Boolean).join('\n') || 'None'}
+
+      **PERSONALIZATION — DISLIKED CONTENT (the user rated these poorly; avoid recommending anything similar in tone, style, or genre):**
+      ${(traktData.rated || []).filter(item => item.rating <= 2).slice(0, 20).map(item => { const m = item.movie || item.show; return m ? `- ${m.title} (${m.year})` : null; }).filter(Boolean).join('\n') || 'None'}
+      ` : ''}
 
       **Format:**
       Your response must be a list of pipe-separated values, with each entry on a new line:
@@ -4014,23 +4107,24 @@ const metaHandler = async function (args) {
       movie|Zodiac|2007
       movie|Prisoners|2013
       `;
-
-      const genAI = new GoogleGenerativeAI(GeminiApiKey);
-      const model = genAI.getGenerativeModel({ model: GeminiModel || DEFAULT_GEMINI_MODEL });
       
-      const aiResult = await withRetry(
+      const responseText = await withRetry(
         async () => {
-          return await model.generateContent(promptText);
+          try {
+            return await aiClient.generateText(promptText);
+          } catch (error) {
+            error.status = error.status || error.httpStatus || 500;
+            throw error;
+          }
         },
         {
           maxRetries: 3,
-          baseDelay: 1000,
+          initialDelay: 1000,
           shouldRetry: (error) => !error.status || error.status !== 400,
-          operationName: "Gemini API call (similar content)"
+          operationName: "AI API call (similar content)"
         }
       );
       
-      const responseText = aiResult.response.text().trim();
       const lines = responseText.split('\n').map(line => line.trim()).filter(Boolean);
 
       const videoPromises = lines.map(async (line) => {
@@ -4073,8 +4167,8 @@ const metaHandler = async function (args) {
         videos: videos,
       };
 
-      // Only cache if we have valid recommendations
-      if (videos.length > 0) {
+      // Only cache if we have valid recommendations and no Trakt personalization
+      if (videos.length > 0 && !traktData) {
         similarContentCache.set(cacheKey, {
           timestamp: Date.now(),
           data: meta
