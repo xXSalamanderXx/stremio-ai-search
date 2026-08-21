@@ -1988,7 +1988,10 @@ async function fetchRpdbPoster(
     return null;
   }
 
-  const cacheKey = `rpdb_${imdbId}_${posterType}`;
+  // Include the API key in the cache key so different tier 0 keys (which bake
+  // the poster style into the key itself) never share cached poster URLs
+  const cacheKey = `rpdb_${rpdbKey}_${imdbId}_${posterType}`;
+  const maskedCacheKey = `rpdb_${rpdbKey.substring(0, 4)}..._${imdbId}_${posterType}`;
   const userTier = getRpdbTierFromApiKey(rpdbKey);
   const isDefaultKey = rpdbKey === DEFAULT_RPDB_KEY;
   const keyType = isDefaultKey ? "default" : "user";
@@ -1996,7 +1999,7 @@ async function fetchRpdbPoster(
   if (isTier0User && rpdbCache.has(cacheKey)) {
     const cached = rpdbCache.get(cacheKey);
     logger.info("RPDB poster cache hit", {
-      cacheKey,
+      cacheKey: maskedCacheKey,
       imdbId,
       posterType,
       cachedAt: new Date(cached.timestamp).toISOString(),
@@ -2027,7 +2030,7 @@ async function fetchRpdbPoster(
     });
   } else {
     logger.info("RPDB poster cache miss", {
-      cacheKey,
+      cacheKey: maskedCacheKey,
       imdbId,
       posterType,
       userTier: isDefaultKey ? "default-key" : "tier0",
@@ -2087,7 +2090,7 @@ async function fetchRpdbPoster(
         data: posterUrl,
       });
       logger.debug("RPDB poster result cached", {
-        cacheKey,
+        cacheKey: maskedCacheKey,
         imdbId,
         posterType,
         found: !!posterUrl,
@@ -2636,6 +2639,23 @@ function deserializeAllCaches(data) {
   }
 
   if (data.rpdbCache) {
+    // Drop legacy rpdb_<imdbId>_<posterType> entries: they were shared across
+    // API keys and stored poster URLs built with whichever key fetched first.
+    // Current keys are rpdb_<apiKey>_<imdbId>_<posterType>, so the segment
+    // after "rpdb_" is an API key, never an IMDb id.
+    if (Array.isArray(data.rpdbCache.entries)) {
+      const originalCount = data.rpdbCache.entries.length;
+      data.rpdbCache.entries = data.rpdbCache.entries.filter(
+        (entry) => !/^rpdb_tt\d+_/.test(entry.key)
+      );
+      const droppedCount = originalCount - data.rpdbCache.entries.length;
+      if (droppedCount > 0) {
+        logger.info("Dropped legacy RPDB cache entries during deserialize", {
+          droppedCount,
+          keptCount: data.rpdbCache.entries.length,
+        });
+      }
+    }
     results.rpdbCache = rpdbCache.deserialize(data.rpdbCache);
   }
 
